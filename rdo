@@ -1,0 +1,392 @@
+#!/usr/bin/perl
+###############################################################################################################
+#
+# title:    rdo (remote "do"):
+#
+# desc:     log into a list of cisco devices and perform a command on each one.
+#           return the result for each device to stdout.
+#
+# usage:    ./rdo             fully interactive mode (one command only)
+#           -c <cmd_file>     pass in command file (for command trees)
+#           -p                specify platform.  currently "cisco" and "linux"/"unix" are supported
+#           -h                help
+#
+# notes:    here are some things to be aware of:
+#
+#               ALL
+#               - login failures relating to bad hostnames are now dealt with nicely.
+#               - the only way i could accurately determine failed login attempts was with
+#                 EOF signals.  therefore whenever we encounter one we suggest credential error.
+#                 of course, there are other instances EOFs could be sent to the terminal, but
+#                 they are fringe cases.  just something to be aware of.
+#
+#               CISCO
+#               - if you perform large show commands, **be sure** to issue term len 0 first.
+#                 if you neglect to do this, the first characters of the next command
+#                 will be cut off due to paging.  imagine the terminal getting stuck at
+#                 a -- MORE -- prompt and the next keypress forwarding that on.
+#               - works with telnet now too.  first, we probe ports 22 and 23 to see what's open.
+#                 we'll prefer ssh over telnet and fail gracefully if neither is open.
+#
+#               *NIX
+#               - the script now works well on *NIX.  but be careful with globbing (i.e. don't do it).  
+#                 if you do something like 'cat /etc/*release', then expect some funky results.
+#
+# author:   drew jess (iamdrew@gmail.com)
+#
+###############################################################################################################
+
+###############################################################################################################
+# packages 
+###############################################################################################################
+
+use strict;
+use warnings;
+use Getopt::Std;
+use Term::ReadKey;
+use Expect;
+use IO::Socket::PortState qw(check_ports);
+use Net::Ping;
+
+###############################################################################################################
+# variables 
+###############################################################################################################
+
+$|++;
+our $opt_c;
+our $opt_h;
+our $opt_p;
+my $usage;
+my $hostfile = "hostlist";      # name of the line seperated file we put hostnames into
+my @hostlist;
+my @cmdlist;
+my $timeout = "2";              # expect timeout in seconds - the lower, the quicker the execution
+my $prompt = '/(?m:.*[\w.-]+\s?(?:\(config[^\)]*\))?\s?[\
++$#>]\s?(?:\(enable\))?\s*$)/'; # what a messy cisco prompt :(
+my $password = "";              # read from user and held in memory.  NOT stored locally
+my $username = "";
+my $platform = "";
+my $cmd = "";
+my $answer = "";                # user's "are you sure" answer
+my $i = 1;                      # just another counter variable.  used in (host $i of $hostcount)
+my $hostcount;
+my $cmdcount;
+my $alive = Net::Ping->new();   # a nice ping object for checking if hosts are alive
+
+###############################################################################################################
+# sub-routines 
+###############################################################################################################
+
+sub get_transport {
+  # should we use ssh or telnet?
+  my $host = $_;
+  my @ports = ("22","23");
+  my $timeout = 2;
+  my %openp;
+
+  foreach my $port (@ports) {
+    my %porthash = (
+                 tcp => {
+                     $port => { name => $port }
+                     }
+                   );
+
+    check_ports($host,$timeout,\%porthash);
+
+    if ($porthash{tcp}{$port}{open}) {
+      $openp{$port} = 1;
+    } else {
+      $openp{$port} = 0;
+    }
+  }
+
+  if ($openp{22}) {
+    return "SSH";
+  } elsif ($openp{23}) { 
+    return "TELNET"; 
+  } else {
+    return "NONE";
+  }
+}
+
+sub get_input {
+  my $key = 0;
+  my $user_input = "";
+
+  # disable control keys and start reading keys until enter key is pressed (ascii 10)
+  ReadMode(4);
+  while (ord($key = ReadKey(0)) != 10) {
+    if (ord($key) == 127 || ord($key) == 8) {
+      # backspace / del was pressed.  remove last char and move cursor back one space.
+      if ( $user_input ) {
+        chop ($user_input);
+        print "\b \b";
+      }
+    } elsif (ord($key) < 32) {
+        # ensure that control characters do nothing
+    } else {
+        $user_input = $user_input . $key;
+        if (defined $_[0] && $_[0] eq "secure") {
+          print "*";
+      } else {
+          print $key;
+      }
+    }
+  }
+  ReadMode(0);
+  return $user_input;
+}
+
+sub login { my ($expect_session, $password) = @_;
+  my $spawn_ok = 0;
+  my $returncode = $expect_session->expect($timeout,
+  # login
+    [ qr/[Pp]assword:/,
+    sub {
+      $spawn_ok = 1;
+      my $expect_session = shift;
+      $expect_session->send("$password","\n");
+
+      exp_continue;
+    } ],
+
+      [
+        eof =>
+        sub {
+          if ($spawn_ok) {
+            print "eof recieved:  chances are your credentials are incorrect\n\n";
+            $spawn_ok = 0;
+          }
+        }
+      ],
+
+      -re => $prompt, # wait for a final shell prompt, then exit expect
+  );
+
+      return $spawn_ok;
+}
+
+sub enable { my ($expect_session, $password) = @_;
+  $expect_session->send("en\n");
+  $expect_session->expect($timeout,
+    [ qr/[Pp]assword:/,
+    sub {
+    my $expect_session = shift;
+    $expect_session->send("$password","\n");
+    exp_continue;
+  } ],
+
+    -re => $prompt,
+ );
+}
+
+sub command { my ($expect_session, $cmd) = @_;
+
+  $cmd =~ s/\*/\\*/g;
+  $expect_session->send("$cmd\n");
+  $expect_session->expect($timeout, -re => $prompt);
+  # check buffer from before expect match
+  my $outp = $expect_session->before();
+
+  # this is a mess, but it was such a painful thing to do.  when (if) i know more i'll fix it
+  my @outarr = grep /\S/, split /\n/, $outp;     # use $outp to populate array seperated by line.
+  pop @outarr;                                   # remove last line by popping array
+  $outp = join '', map "$_\n", @outarr;          # join back up
+
+  @outarr = split(/$cmd/, $outp);                # split $outp when we see $cmd.
+  $outp = $outarr[-1];                           # the last element has our output
+
+  if ($outp) {
+    $outp =~ s/(^|\n)[\n\s]*/$1/g;               # clean up any unneccessary whitespace
+  }
+
+  return $outp;
+}
+
+sub parse_options {
+  getopts('p:c:h');
+  
+  # check for command mode
+  if ($opt_c) {
+    open (COMMANDS, $opt_c) or die ("\n\ncan't locate commandfile \"$opt_c\"... is it there?\n");
+    @cmdlist = <COMMANDS>;
+    $cmdcount = @cmdlist;
+    close (HOSTFILE);
+  } 
+  
+  # determine platform for expect prompt
+  if ($opt_p && $opt_p =~ /.*n[i|u]x/i) {
+    $platform = "*NIX";
+    print "\n\n* * UNIX platform selected * *";
+    $prompt = ".* [$|#] ";
+  } elsif ($opt_p && $opt_p =~ /cisco/i) {
+    $platform = "CISCO";
+    print "\n\n* * CISCO platform selected * * ";
+  } else {
+    $platform = "CISCO";
+    print "\n\n* * No platform specified.  Selecting CISCO by default * *";
+  }
+
+  # check if anyone needs help
+  if ($opt_h) {
+      print $usage;
+      exit 0;
+  }
+}
+
+###############################################################################################################
+## main 
+###############################################################################################################
+
+# usage
+$usage = qq{$0 - perform commands on hosts using expect
+
+usage:
+  $0                  run in default mode; one command is prompted for
+  -c <cmd_file>       provide a line seperated command file for parsing.
+  -p <platform>       specify platform.  [cisco|linux|unix]
+  -h                  this help message
+
+};
+
+# menu prompt and credential gathering
+print "\n-----------------------------------------\n";
+print "        rdo - run a cisco command        \n";
+print "  on numerous devices and return output  \n";
+print "-----------------------------------------\n";
+print "\nusername: ";
+$username = get_input();
+print "\npassword: ";
+$password = get_input("secure");
+
+# get hostlist
+open (HOSTFILE, $hostfile) or die ("\ncan't load hostfile \"$hostfile\".  is it there?\n");
+@hostlist = <HOSTFILE>;
+$hostcount = @hostlist;
+close (HOSTFILE);
+
+parse_options();
+
+# print hosts
+print "\n\ndevices to log into:\n\n";
+foreach(@hostlist) {
+    chomp $_;
+    print "  $_\n";
+}
+# get commands
+if (!$cmdcount) {
+    print "\nenter the command you want to perform: ";
+    push (@cmdlist, get_input());
+} else { 
+  print "\n\nrunning in -c mode; reading \"$opt_c\" for command list...\n";
+}
+print "\nyou want to perform the following command(s) on all hosts:\n\n";
+
+foreach(@cmdlist) {
+  chomp $_;
+  print "  $_\n";
+}
+
+print "\nis this correct? [Y/N]: ";
+$answer = get_input();
+
+if($answer ne "Y" && $answer ne "y") {
+  print "\n\nproblem: you weren't sure about your command.  that's okay though.  better safe than sorry.\n";
+  exit 1;
+} else {
+    print "\n";
+}
+
+
+# beginning of expect; loop around each host in @hostlist
+print "\n\nBeginning expect...\n\n";
+foreach (@hostlist) {
+  my $host = $_;
+
+  # header
+  my $line = "-" x 40;
+  print $line . " $host ($i of $hostcount) " . $line . "\n\n";
+
+  # start up our expect session
+  my $expect_session = new Expect();
+  $expect_session->log_stdout(0);  # let's keep things quiet on screen; we only want command output.
+  $expect_session->log_file(".expectlog");
+
+  # ssh or telnet?
+  my $transport = get_transport($host);
+
+  if ($transport eq "SSH") {
+    print "chosen ssh to connect.\n";
+    $expect_session->spawn("/usr/bin/ssh -o StrictHostKeyChecking=no $username\@$host")
+    or die ("\nfor some reason we can't establish an SSH session to $host.\n
+               it's something to do with the spawn process: $!\n");
+  } elsif ($transport eq "TELNET") {
+    print "chosen telnet to connect.\n";
+    $expect_session->spawn("/usr/bin/telnet $host") 
+    or die ("\nfor some reason, we can't extablish a telnet session to $host.\n
+               it's something to do with the spawn process: $!\n");
+
+    # we need to manually send username for telnet...
+    $expect_session->expect($timeout,
+    [ qr/[Uu]sername:/,
+    sub {
+      my $expect_session = shift;
+      $expect_session->send("$username","\n");
+      exp_continue;
+        } ]
+    );
+  } else {
+    $transport = 0;  
+  }
+
+  my $loggedin = login($expect_session, $password);
+
+  if ($loggedin) {
+    print "logged in to $host.\n\n";
+  } else {
+    my $hostup = $alive->ping($host, 2);
+    if ($hostup) {
+      print "could not log in to $host.  no ports open, but it is alive.  firewall?\n\n";
+    } else {
+      print "could not log in to $host.  not responding to ping either.\n\n";  
+    }
+    $i = $i + 1;
+    next;
+  }
+
+  # perform each command in @cmdlist in turn
+  foreach(@cmdlist) {
+    # scoping $output here to solve apparent re-use issue
+    my $output;
+    chomp $_;
+    
+    if ($platform eq "CISCO") {
+      # we have a special subroutine for enable on cisco devices
+      if (substr($_, 0, 2) eq "en") {
+        enable($expect_session, $password);
+      } else {
+        $output = command($expect_session, $_);
+      }
+    } else {
+      $output = command($expect_session, $_);
+    }
+
+    # pad output (aesthetics) and display
+    if ($output) {
+      $output =~ s/^/    /g;
+      $output =~ s/\n/\n    /g;
+      print "Output for \"$_\": \n\n$output\n";
+    } else {
+      print "No output for \"$_\" \n\n";
+    }
+  }
+
+  $i = $i + 1;
+  print "Closed connection to $host.\n\n";
+}
+
+print "\n";
+
+###############################################################################################################
+# eof 
+###############################################################################################################
